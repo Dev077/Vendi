@@ -1,10 +1,19 @@
 import React, { useRef, useState, useEffect, useCallback } from 'react';
 import Webcam from 'react-webcam';
+import { useVoiceStream } from './useVoiceStream';
+
+const WS_URL = 'ws://127.0.0.1:5000/ws/audio';
 
 function App() {
   const webcamRef = useRef(null);
   const intervalRef = useRef(null);
   const [isAwake, setIsAwake] = useState(false);
+
+  // Voice streaming activates only after wake.
+  const { connected, listening, speaking } = useVoiceStream({
+    enabled: isAwake,
+    wsUrl: WS_URL,
+  });
 
   // Function to capture the current frame and send it to Flask
   const captureAndProcess = useCallback(async () => {
@@ -88,6 +97,11 @@ function App() {
         <div style={{ textAlign: 'center' }}>
           <h1>Character Awake</h1>
           <p>Human detected. Character has taken over from here.</p>
+          <div style={{ marginTop: 24, fontSize: 14, opacity: 0.8 }}>
+            <div>WS: {connected ? ' connected' : ' disconnected'}</div>
+            <div>Mic: {listening ? ' listening' : ' idle'}</div>
+            <div>VAD: {speaking ? ' speaking' : ' silent'}</div>
+          </div>
         </div>
       )}
     </div>
