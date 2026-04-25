@@ -12,12 +12,30 @@ const live2d = PIXI.live2d;
   const model = await live2d.Live2DModel.from(localModel);
   app.stage.addChild(model);
 
-  // Layout
-  model.scale.set(Math.min((innerWidth * 0.9) / model.width, (innerHeight * 0.9) / model.height));
+  // Layout & Initial Scaling
+  const baseScale = Math.min((innerWidth * 0.9) / model.width, (innerHeight * 0.9) / model.height);
+  model.scale.set(baseScale);
   model.y = (innerHeight - model.height) / 2;
   model.x = (innerWidth - model.width) / 2;
 
   draggable(model);
+
+  // --- ZOOM LOGIC ---
+  const canvas = document.getElementById("canvas");
+  canvas.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    
+    // Zoom speed factor
+    const zoomSpeed = 0.001;
+    let newScale = model.scale.x - e.deltaY * zoomSpeed * model.scale.x;
+    
+    // Clamp zoom between 0.1x and 5x of the base scale
+    const minScale = baseScale * 0.2;
+    const maxScale = baseScale * 10;
+    newScale = Math.max(minScale, Math.min(maxScale, newScale));
+    
+    model.scale.set(newScale);
+  }, { passive: false });
 
   const controlDiv = document.getElementById("control");
   const progressInner = document.getElementById("progress-inner");
@@ -32,16 +50,15 @@ const live2d = PIXI.live2d;
       btn.innerText = `Motion ${index.toString().padStart(2, '0')}`;
       btn.onclick = () => {
         model.motion("", index);
-        // Store duration for progress bar
         const motionDef = model.internalModel.motionManager.definitions[""][index];
-        model.currentMotionDuration = motionDef.Duration || 5000; // fallback to 5s
+        model.currentMotionDuration = motionDef.Duration || 5;
       };
       section.appendChild(btn);
     });
     controlDiv.appendChild(section);
   }
 
-  // --- 2. EXPRESSIONS (Corrected Ranges) ---
+  // --- 2. EXPRESSIONS ---
   const expressionParams = [
     { id: "ParamMouthOpenY", name: "Mouth Open", min: 0, max: 1, val: 0 },
     { id: "ParamMouthForm", name: "Mouth Form", min: -1, max: 1, val: 0 },
@@ -78,21 +95,15 @@ const live2d = PIXI.live2d;
   });
   controlDiv.appendChild(expSection);
 
-  // --- 3. THE "FORCE" LOOP ---
-  // We use the internal update event to override parameters AFTER motions are calculated
   model.on("beforeModelUpdate", () => {
     expressionParams.forEach(p => {
       model.internalModel.coreModel.setParameterValueById(p.id, p.val);
     });
   });
 
-  // --- 4. ACCURATE PROGRESS BAR ---
   app.ticker.add(() => {
     const mm = model.internalModel.motionManager;
     if (mm.playing) {
-        // activeMotion is hidden in state, we estimate based on definitions
-        // Current display library doesn't expose normalized progress easily, 
-        // so we track elapsed time vs the duration we stored.
         const elapsed = mm.state.time % (model.currentMotionDuration || 5);
         const progress = elapsed / (model.currentMotionDuration || 5);
         progressInner.style.width = Math.min(progress * 100, 100) + "%";
@@ -105,7 +116,7 @@ const live2d = PIXI.live2d;
     const randomIndex = Math.floor(Math.random() * motionNames.length);
     model.motion("", randomIndex);
     const motionDef = model.internalModel.motionManager.definitions[""][randomIndex];
-    model.currentMotionDuration = motionDef.Duration || 5000;
+    model.currentMotionDuration = motionDef.Duration || 5;
   });
 
 })();
