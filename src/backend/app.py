@@ -1,3 +1,9 @@
+import os
+import re
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import torch
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_sock import Sock
@@ -5,11 +11,36 @@ import cv2
 import numpy as np
 import base64
 import time
-import struct
 from dotenv import load_dotenv
 from google.cloud import vision
 
+from backend.audio.asr import ASR
+from backend.audio.tts import load_tts
+from backend.model.generate import reply_to_transcript
+from backend.model.loader import load_model
+
 load_dotenv()
+
+_SENTENCE_END = re.compile(r"[.!?\n]")
+
+# Heavy components — loaded lazily on first WS connection so the vision
+# endpoint stays usable without GPU/model deps.
+_voice_components: dict | None = None
+
+
+def _get_voice_components() -> dict:
+    global _voice_components
+    if _voice_components is None:
+        print("[voice] loading ASR, Gemma, and TTS...")
+        processor, model = load_model()
+        _voice_components = {
+            "asr": ASR(),
+            "processor": processor,
+            "model": model,
+            "tts": load_tts(),
+        }
+        print("[voice] ready")
+    return _voice_components
 
 app = Flask(__name__)
 # Enable CORS so the React frontend can communicate with this API
@@ -89,18 +120,80 @@ def process_frame():
 
 
 # ---------------------------------------------------------------------------
-# WebSocket endpoint for streaming audio from the frontend.
+# WebSocket endpoint for streaming audio in/out.
 #
-# Protocol:
-#   - Client sends JSON text messages for control:
-#       {"type": "start"}            → begin a new utterance
-#       {"type": "end"}              → end of utterance, ready for ASR
-#       {"type": "meta", "sampleRate": 16000, "channels": 1, "format": "f32"}
-#   - Client sends BINARY messages containing raw Float32 PCM samples
-#     (little-endian) while an utterance is in progress.
+# Client → server:
+#   - {"type": "meta", "sampleRate": 16000, "channels": 1, "format": "f32"}
+#   - {"type": "start"}                begin a new utterance
+#   - binary Float32 LE PCM            mic frames during an utterance
+#   - {"type": "end"} | {"type": "end", "discard": true}
 #
-# Server buffers PCM per-utterance and (later) hands it to ASR.transcribe_pcm.
+# Server → client:
+#   - {"type": "transcript", "text": ...}
+#   - {"type": "token", "text": ...}
+#   - {"type": "audio_start", "sample_rate": N}    precedes binary audio
+#   - binary int16 LE mono PCM                     TTS frames
+#   - {"type": "audio_end"}                        closes one sentence's audio
+#   - {"type": "done"}
+#   - {"type": "error", "message": ...}
 # ---------------------------------------------------------------------------
+def _speak(ws, tts, text: str) -> None:
+    text = text.strip()
+    if not text:
+        return
+    import json
+    ws.send(json.dumps({"type": "audio_start", "sample_rate": tts.sample_rate}))
+    for pcm in tts.synthesize_stream(text):
+        if pcm:
+            ws.send(pcm)
+    ws.send(json.dumps({"type": "audio_end"}))
+
+
+def _handle_utterance(ws, pcm_buffer: bytearray, history: list, discard: bool) -> None:
+    import json
+    if discard or not pcm_buffer:
+        return
+
+    comps = _get_voice_components()
+    asr = comps["asr"]
+    processor = comps["processor"]
+    model = comps["model"]
+    tts = comps["tts"]
+
+    audio = np.frombuffer(bytes(pcm_buffer), dtype=np.float32)
+    transcript = asr.transcribe_pcm(audio)
+
+    if not transcript.text or not transcript.is_confident():
+        print(f"[voice] dropped low-confidence: {transcript.text!r} "
+              f"logprob={transcript.avg_logprob:.2f} no_speech={transcript.no_speech_prob:.2f}")
+        return
+
+    ws.send(json.dumps({"type": "transcript", "text": transcript.text}))
+
+    reply_chunks: list[str] = []
+    sentence_buf = ""
+    for chunk in reply_to_transcript(processor, model, transcript.text, history=history, stream=True):
+        reply_chunks.append(chunk)
+        ws.send(json.dumps({"type": "token", "text": chunk}))
+        sentence_buf += chunk
+        while True:
+            m = _SENTENCE_END.search(sentence_buf)
+            if not m:
+                break
+            sentence, sentence_buf = sentence_buf[: m.end()], sentence_buf[m.end():]
+            _speak(ws, tts, sentence)
+
+    if sentence_buf.strip():
+        _speak(ws, tts, sentence_buf)
+
+    history.append({"role": "user", "content": [{"type": "text", "text": transcript.text}]})
+    history.append({"role": "assistant", "content": [{"type": "text", "text": "".join(reply_chunks)}]})
+    ws.send(json.dumps({"type": "done"}))
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 @sock.route('/ws/audio')
 def audio_socket(ws):
     import json
@@ -110,6 +203,7 @@ def audio_socket(ws):
     sample_rate = 16000  # default; client should override via meta
     in_utterance = False
     utterance_start = 0.0
+    history: list = []
 
     try:
         while True:
@@ -157,22 +251,16 @@ def audio_socket(ws):
                 duration = time.time() - utterance_start
                 num_samples = len(pcm_buffer) // 4  # float32 = 4 bytes/sample
                 audio_seconds = num_samples / sample_rate if sample_rate else 0
-                print(f"[ws] utterance end — {len(pcm_buffer)} bytes, "
-                      f"{num_samples} samples, {audio_seconds:.2f}s of audio, "
-                      f"capture took {duration:.2f}s")
+                discard = bool(ctrl.get("discard"))
+                print(f"[ws] utterance end — {num_samples} samples, "
+                      f"{audio_seconds:.2f}s audio, capture {duration:.2f}s"
+                      f"{' (discarded)' if discard else ''}")
 
-                # ----- HOOK FOR WHISPER -----
-                # When ready, convert pcm_buffer to numpy float32 and call
-                # asr.transcribe_pcm(np.frombuffer(bytes(pcm_buffer), dtype=np.float32))
-                # then ws.send the resulting Transcript as JSON.
-                # ----------------------------
-
-                ws.send(json.dumps({
-                    "type": "utterance_received",
-                    "bytes": len(pcm_buffer),
-                    "samples": num_samples,
-                    "seconds": round(audio_seconds, 3),
-                }))
+                try:
+                    _handle_utterance(ws, pcm_buffer, history, discard)
+                except Exception as e:
+                    print(f"[voice] error: {e}")
+                    ws.send(json.dumps({"type": "error", "message": str(e)}))
                 pcm_buffer = bytearray()
 
             elif ctrl_type == "ping":
@@ -189,4 +277,4 @@ def audio_socket(ws):
 
 if __name__ == '__main__':
     # Run the Flask server on port 5000
-    app.run(port=5000, debug=True)
+    app.run(port=5000, debug=True, use_reloader=False)

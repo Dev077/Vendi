@@ -32,6 +32,7 @@ export function useVoiceStream({
   const streamRef = useRef(null);
   const workletNodeRef = useRef(null);
   const sourceNodeRef = useRef(null);
+  const playbackRef = useRef(null);
 
   const speakingRef = useRef(false);
   const utteranceStartRef = useRef(0);
@@ -59,14 +60,19 @@ export function useVoiceStream({
         }
         setConnected(true);
 
+        playbackRef.current = createPlayback();
+
         ws.onmessage = (ev) => {
-          // Server acks / errors / future transcripts land here.
-          try {
-            const msg = JSON.parse(ev.data);
-            console.log('[ws]', msg);
-          } catch {
-            // ignore non-JSON
+          if (typeof ev.data !== 'string') {
+            // Binary frame from server = int16 PCM TTS audio.
+            playbackRef.current?.pushPCM(ev.data);
+            return;
           }
+          let msg;
+          try { msg = JSON.parse(ev.data); } catch { return; }
+          if (msg.type === 'audio_start') playbackRef.current?.start(msg.sample_rate);
+          else if (msg.type === 'audio_end') playbackRef.current?.flush();
+          else console.log('[ws]', msg);
         };
         ws.onclose = () => setConnected(false);
 
@@ -191,14 +197,59 @@ export function useVoiceStream({
       try { streamRef.current?.getTracks().forEach((t) => t.stop()); } catch {}
       try { audioCtxRef.current?.close(); } catch {}
       try { wsRef.current?.close(); } catch {}
+      try { playbackRef.current?.close(); } catch {}
 
       workletNodeRef.current = null;
       sourceNodeRef.current = null;
       streamRef.current = null;
       audioCtxRef.current = null;
       wsRef.current = null;
+      playbackRef.current = null;
     };
   }, [enabled, wsUrl, startThreshold, endThreshold, silenceMs, minUtteranceMs]);
 
   return { connected, listening, speaking };
+}
+
+/**
+ * Gapless int16 PCM playback queue. Buffers chunks per sentence and
+ * schedules them back-to-back on a single AudioContext clock.
+ */
+function createPlayback() {
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  let sampleRate = 22050;
+  let pending = [];
+  let nextStart = 0;
+
+  return {
+    start(rate) {
+      sampleRate = rate || sampleRate;
+      pending = [];
+      if (ctx.state === 'suspended') ctx.resume();
+    },
+    pushPCM(arrayBuffer) {
+      const i16 = new Int16Array(arrayBuffer);
+      const f32 = new Float32Array(i16.length);
+      for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 0x8000;
+      pending.push(f32);
+    },
+    flush() {
+      if (!pending.length) return;
+      let total = 0;
+      for (const a of pending) total += a.length;
+      const buf = ctx.createBuffer(1, total, sampleRate);
+      const ch = buf.getChannelData(0);
+      let offset = 0;
+      for (const a of pending) { ch.set(a, offset); offset += a.length; }
+      pending = [];
+
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
+      const startAt = Math.max(ctx.currentTime, nextStart);
+      src.start(startAt);
+      nextStart = startAt + buf.duration;
+    },
+    close() { try { ctx.close(); } catch {} },
+  };
 }
