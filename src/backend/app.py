@@ -13,7 +13,7 @@ import cv2
 import numpy as np
 import base64
 import time
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 from google.cloud import vision
 
 from backend.audio.asr import ASR
@@ -28,7 +28,16 @@ from backend.model.generate import (
 from backend.model.loader import load_model
 from backend.tools.dispenser import TOOL_SCHEMAS, Dispenser, build_dispatch
 
-load_dotenv()
+_dotenv_path = find_dotenv(usecwd=True)
+load_dotenv(_dotenv_path)
+
+# Resolve a relative GOOGLE_APPLICATION_CREDENTIALS against the .env file's
+# directory (typically the project root) so it works regardless of CWD.
+_creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+if _creds and not os.path.isabs(_creds) and _dotenv_path:
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.normpath(
+        os.path.join(os.path.dirname(_dotenv_path), _creds)
+    )
 
 _SENTENCE_END = re.compile(r"[.!?\n]")
 

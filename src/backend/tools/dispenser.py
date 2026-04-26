@@ -30,10 +30,10 @@ class Dispenser:
     def _run_cycle(self) -> None:
         with self._lock:
             self._com.set(DISPENSE_ANGLE)
-            self._com.wait_done()
+            self._com.wait_move(DISPENSE_ANGLE)
             time.sleep(DROP_DELAY_SECONDS)
             self._com.set(RETURN_ANGLE)
-            self._com.wait_done()
+            self._com.wait_move(RETURN_ANGLE)
 
     def dispense_can(self) -> dict:
         """Fire-and-forget: kick off the dispense cycle on a background thread.

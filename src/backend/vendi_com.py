@@ -13,28 +13,32 @@ class VendiCom:
         else:
             self.ser = serial.Serial(port, baud_rate, timeout=1)
 
+    # Motor: 12 RPM × 2048 steps/rev → ~2.44ms/step. 250° ≈ 1422 steps ≈ 3.47s.
+    # Per-degree cost in seconds, plus a fixed buffer for parseFloat + prints.
+    _SECONDS_PER_DEGREE = 60.0 / (12 * 360)
+    _OVERHEAD_SECONDS = 0.5
+
     def set(self, angle):
+        # Drop any stale firmware chatter before issuing a new command so it
+        # can't be mistaken for output from this move.
+        try:
+            self.ser.reset_input_buffer()
+        except Exception:
+            pass
         # Trailing \n terminates Serial.parseFloat() on the firmware immediately
         # instead of making it wait for its 1s stream timeout.
         self.ser.write(f"{angle}\n".encode())
         self.ser.flush()
 
-    def wait_done(self, timeout=10.0):
-        """Block until the firmware prints 'Done.', or `timeout` seconds elapse.
+    def wait_move(self, angle):
+        """Block long enough for `angle` degrees of motor travel to finish.
 
-        The firmware emits 'Done.' on its own line after each `myStepper.step()`
-        completes. We rely on this to serialize back-to-back motor commands
-        instead of sleeping a magic number.
+        The firmware was supposed to emit 'Done.' after each step(), but on this
+        32u4 board that line is unreliable (USB CDC drops post-motor prints).
+        Speed is deterministic, so we time it instead.
         """
         import time
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            line = self.ser.readline()  # respects pyserial's per-read timeout
-            if not line:
-                continue
-            if line.strip() == b"Done.":
-                return
-        raise TimeoutError("VendiCom: timed out waiting for 'Done.' from firmware")
+        time.sleep(abs(angle) * self._SECONDS_PER_DEGREE + self._OVERHEAD_SECONDS)
 
     def __del__(self):
         try:
