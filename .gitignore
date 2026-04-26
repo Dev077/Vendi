@@ -3,3 +3,5 @@
 .env
 src/backend/aise3010-492923-01669646b860.json
 **/__pycache__/
+src/backend/audio/en_US-amy-medium.onnx.json
+src/backend/audio/en_US-amy-medium.onnx

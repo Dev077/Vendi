@@ -38,7 +38,7 @@ def generate_reply(
     processor,
     model,
     messages: list[Message],
-    max_new_tokens: int = 256,
+    max_new_tokens: int = 164,
 ) -> str:
     inputs, input_len = _prepare_inputs(processor, model, messages)
     outputs = model.generate(**inputs, max_new_tokens=max_new_tokens)
@@ -49,7 +49,7 @@ def stream_reply(
     processor,
     model,
     messages: list[Message],
-    max_new_tokens: int = 256,
+    max_new_tokens: int = 164,
 ) -> Iterator[str]:
     inputs, _ = _prepare_inputs(processor, model, messages)
 
@@ -78,7 +78,7 @@ def reply_to_transcript(
     history: list[Message] | None = None,
     *,
     stream: bool = True,
-    max_new_tokens: int = 256,
+    max_new_tokens: int = 164,
 ) -> Iterator[str] | str:
     messages = list(history or [])
     messages.append(build_user_message(transcript))
