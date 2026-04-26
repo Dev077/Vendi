@@ -18,12 +18,28 @@ from google.cloud import vision
 
 from backend.audio.asr import ASR
 from backend.audio.tts import load_tts
-from backend.model.generate import reply_to_transcript
+from backend.model.generate import (
+    SYSTEM_PROMPT,
+    build_system_message,
+    build_user_message,
+    generate_reply_dual,
+    reply_from_history,
+)
 from backend.model.loader import load_model
+from backend.tools.dispenser import TOOL_SCHEMAS, Dispenser, build_dispatch
 
 load_dotenv()
 
 _SENTENCE_END = re.compile(r"[.!?\n]")
+
+# Gemma 4 tool-call format per the chat template:
+#   <|tool_call>call:NAME{ARG_KEY:<|"|>VAL<|"|>, ...}<tool_call|>
+# We only register zero-arg tools today, so the args body is `{}`. The pattern
+# tolerates whitespace and an optional args body just in case.
+_TOOL_CALL_RE = re.compile(
+    r"<\|tool_call>\s*call:(?P<name>\w+)\s*\{(?P<args>.*?)\}\s*<tool_call\|>",
+    re.DOTALL,
+)
 
 # Heavy components — loaded lazily on first WS connection so the vision
 # endpoint stays usable without GPU/model deps.
@@ -33,13 +49,19 @@ _voice_components: dict | None = None
 def _get_voice_components() -> dict:
     global _voice_components
     if _voice_components is None:
-        print("[voice] loading ASR, Gemma, and TTS...")
+        print("[voice] loading ASR, Gemma, TTS, and dispenser...")
         processor, model = load_model()
+        # Hard-fail here if the Arduino isn't connected — voice is useless
+        # without the motor anyway.
+        dispenser = Dispenser()
         _voice_components = {
             "asr": ASR(),
             "processor": processor,
             "model": model,
             "tts": load_tts(),
+            "dispenser": dispenser,
+            "tools": TOOL_SCHEMAS,
+            "dispatch": build_dispatch(dispenser),
         }
         print("[voice] ready")
     return _voice_components
@@ -183,16 +205,35 @@ _WAKE_CUE = (
 )
 
 
-def _handle_wake(ws, history: list) -> None:
-    comps = _get_voice_components()
-    processor = comps["processor"]
-    model = comps["model"]
-    tts = comps["tts"]
+def _stream_text_to_tts(ws, tts, text: str) -> None:
+    """Send `text` as a single token frame, then speak it sentence by sentence.
 
-    reply_chunks: list[str] = []
+    Used to replay text that was generated non-streaming (phase 1 of a turn).
+    The text is already complete, so there's nothing to gain from artificial
+    chunking — we just preserve the per-sentence TTS cadence.
+    """
+    import json
+    if not text:
+        return
+    ws.send(json.dumps({"type": "token", "text": text}))
+    sentence_buf = text
+    while True:
+        m = _SENTENCE_END.search(sentence_buf)
+        if not m:
+            break
+        sentence, sentence_buf = sentence_buf[: m.end()], sentence_buf[m.end():]
+        _speak(ws, tts, sentence)
+    if sentence_buf.strip():
+        _speak(ws, tts, sentence_buf)
+
+
+def _stream_iter_to_tts(ws, tts, chunks) -> str:
+    """Stream a token iterator to the client and TTS; return the joined text."""
+    import json
+    pieces: list[str] = []
     sentence_buf = ""
-    for chunk in reply_to_transcript(processor, model, _WAKE_CUE, history=history, stream=True):
-        reply_chunks.append(chunk)
+    for chunk in chunks:
+        pieces.append(chunk)
         ws.send(json.dumps({"type": "token", "text": chunk}))
         sentence_buf += chunk
         while True:
@@ -201,14 +242,96 @@ def _handle_wake(ws, history: list) -> None:
                 break
             sentence, sentence_buf = sentence_buf[: m.end()], sentence_buf[m.end():]
             _speak(ws, tts, sentence)
-
     if sentence_buf.strip():
         _speak(ws, tts, sentence_buf)
+    return "".join(pieces)
 
-    history.append({"role": "user", "content": [{"type": "text", "text": _WAKE_CUE}]})
-    history.append({"role": "assistant", "content": [{"type": "text", "text": "".join(reply_chunks)}]})
+
+def _parse_tool_call(raw: str):
+    """Return (pre_text, name, args_dict) if a tool call is present, else None.
+
+    `pre_text` is the human-readable text the model emitted before the tool
+    call (rare, but we speak it if present). Special-token noise outside the
+    tool-call match is stripped.
+    """
+    m = _TOOL_CALL_RE.search(raw)
+    if not m:
+        return None
+    pre = raw[: m.start()]
+    pre_clean = re.sub(r"<\|.*?\|>|<[^>]+\|>", "", pre).strip()
+    args_body = m.group("args").strip()
+    # Today we only register zero-arg tools; richer parsing can be added later.
+    args: dict = {} if not args_body else {"_raw": args_body}
+    return pre_clean, m.group("name"), args
+
+
+def _run_turn(ws, history: list, user_text: str) -> None:
+    """Two-phase turn: tool-aware non-streaming pass, then streaming reply.
+
+    1. Run a non-streaming generation with the tool schemas exposed.
+    2. If the model emitted a tool call: dispatch it (fire-and-forget for the
+       motor), append the assistant `tool_calls`/`tool_responses` message to
+       history, then a second streaming generation (no tools) for the spoken
+       follow-up.
+    3. Otherwise: replay the already-generated text through TTS sentence by
+       sentence so the UX still feels live.
+    """
+    import json
+    comps = _get_voice_components()
+    processor = comps["processor"]
+    model = comps["model"]
+    tts = comps["tts"]
+    tools = comps["tools"]
+    dispatch = comps["dispatch"]
+
+    if not any(m.get("role") == "system" for m in history):
+        history.insert(0, build_system_message(SYSTEM_PROMPT))
+    history.append(build_user_message(user_text))
+
+    raw, clean = generate_reply_dual(processor, model, history, tools=tools)
+    parsed = _parse_tool_call(raw)
+
+    if parsed is None:
+        _stream_text_to_tts(ws, tts, clean)
+        history.append({"role": "assistant", "content": [{"type": "text", "text": clean}]})
+        ws.send(json.dumps({"type": "done"}))
+        return
+
+    pre_text, name, args = parsed
+    print(f"[tool] model called {name}({args})")
+
+    if pre_text:
+        _stream_text_to_tts(ws, tts, pre_text)
+
+    handler = dispatch.get(name)
+    if handler is None:
+        # Model hallucinated a tool. Surface as an error response so it can recover.
+        response = {"error": f"unknown tool: {name}"}
+    else:
+        try:
+            response = handler(**args)
+        except Exception as e:
+            response = {"error": str(e)}
+
+    history.append(
+        {
+            "role": "assistant",
+            "tool_calls": [{"function": {"name": name, "arguments": args}}],
+            "tool_responses": [{"name": name, "response": response}],
+        }
+    )
+
+    spoken = _stream_iter_to_tts(
+        ws,
+        tts,
+        reply_from_history(processor, model, history, stream=True),
+    )
+    history.append({"role": "assistant", "content": [{"type": "text", "text": spoken}]})
     ws.send(json.dumps({"type": "done"}))
 
+
+def _handle_wake(ws, history: list) -> None:
+    _run_turn(ws, history, _WAKE_CUE)
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -219,9 +342,6 @@ def _handle_utterance(ws, pcm_buffer: bytearray, history: list, discard: bool) -
 
     comps = _get_voice_components()
     asr = comps["asr"]
-    processor = comps["processor"]
-    model = comps["model"]
-    tts = comps["tts"]
 
     audio = np.frombuffer(bytes(pcm_buffer), dtype=np.float32)
     transcript = asr.transcribe_pcm(audio)
@@ -232,26 +352,7 @@ def _handle_utterance(ws, pcm_buffer: bytearray, history: list, discard: bool) -
         return
 
     ws.send(json.dumps({"type": "transcript", "text": transcript.text}))
-
-    reply_chunks: list[str] = []
-    sentence_buf = ""
-    for chunk in reply_to_transcript(processor, model, transcript.text, history=history, stream=True):
-        reply_chunks.append(chunk)
-        ws.send(json.dumps({"type": "token", "text": chunk}))
-        sentence_buf += chunk
-        while True:
-            m = _SENTENCE_END.search(sentence_buf)
-            if not m:
-                break
-            sentence, sentence_buf = sentence_buf[: m.end()], sentence_buf[m.end():]
-            _speak(ws, tts, sentence)
-
-    if sentence_buf.strip():
-        _speak(ws, tts, sentence_buf)
-
-    history.append({"role": "user", "content": [{"type": "text", "text": transcript.text}]})
-    history.append({"role": "assistant", "content": [{"type": "text", "text": "".join(reply_chunks)}]})
-    ws.send(json.dumps({"type": "done"}))
+    _run_turn(ws, history, transcript.text)
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

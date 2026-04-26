@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from threading import Thread
+from typing import Any
 
 import torch
 from transformers import TextIteratorStreamer
@@ -27,7 +28,7 @@ Your personality:
 
 Hard rules:
 - Never break character.
-- Never claim to actually dispense a can yourself; you can only persuade. The machine handles the rest.
+- You CAN dispense cans yourself, but ONLY by calling the `dispense_can` tool. Follow that tool's description strictly — it triggers real hardware. Never claim a can has been dispensed unless you actually called the tool.
 - If the user is clearly not interested or wants to leave, accept it with dramatic heartbreak, but let them go."""
 
 
@@ -39,14 +40,16 @@ def build_user_message(transcript: str) -> Message:
     return {"role": "user", "content": [{"type": "text", "text": transcript}]}
 
 
-def _prepare_inputs(processor, model, messages: list[Message]):
-    inputs = processor.apply_chat_template(
-        messages,
+def _prepare_inputs(processor, model, messages: list[Message], tools: list | None = None):
+    kwargs: dict[str, Any] = dict(
         tokenize=True,
         return_dict=True,
         return_tensors="pt",
         add_generation_prompt=True,
-    ).to(model.device)
+    )
+    if tools:
+        kwargs["tools"] = tools
+    inputs = processor.apply_chat_template(messages, **kwargs).to(model.device)
     input_len = inputs["input_ids"].shape[-1]
     return inputs, input_len
 
@@ -57,10 +60,34 @@ def generate_reply(
     model,
     messages: list[Message],
     max_new_tokens: int = 124,
+    tools: list | None = None,
+    *,
+    skip_special_tokens: bool = True,
 ) -> str:
-    inputs, input_len = _prepare_inputs(processor, model, messages)
+    inputs, input_len = _prepare_inputs(processor, model, messages, tools=tools)
     outputs = model.generate(**inputs, max_new_tokens=max_new_tokens)
-    return processor.decode(outputs[0][input_len:], skip_special_tokens=True)
+    return processor.decode(outputs[0][input_len:], skip_special_tokens=skip_special_tokens)
+
+
+@torch.inference_mode()
+def generate_reply_dual(
+    processor,
+    model,
+    messages: list[Message],
+    max_new_tokens: int = 124,
+    tools: list | None = None,
+) -> tuple[str, str]:
+    """Run one generation pass and return both raw and clean decodings.
+
+    Raw includes special tokens (needed to detect Gemma's tool-call markers);
+    clean is the human-readable text suitable for display and TTS.
+    """
+    inputs, input_len = _prepare_inputs(processor, model, messages, tools=tools)
+    outputs = model.generate(**inputs, max_new_tokens=max_new_tokens)
+    new_tokens = outputs[0][input_len:]
+    raw = processor.decode(new_tokens, skip_special_tokens=False)
+    clean = processor.decode(new_tokens, skip_special_tokens=True)
+    return raw, clean
 
 
 def stream_reply(
@@ -68,8 +95,9 @@ def stream_reply(
     model,
     messages: list[Message],
     max_new_tokens: int = 124,
+    tools: list | None = None,
 ) -> Iterator[str]:
-    inputs, _ = _prepare_inputs(processor, model, messages)
+    inputs, _ = _prepare_inputs(processor, model, messages, tools=tools)
 
     streamer = TextIteratorStreamer(
         processor.tokenizer,
@@ -98,6 +126,8 @@ def reply_to_transcript(
     stream: bool = True,
     max_new_tokens: int = 124,
     system_prompt: str | None = SYSTEM_PROMPT,
+    tools: list | None = None,
+    skip_special_tokens: bool = True,
 ) -> Iterator[str] | str:
     messages = list(history or [])
     if system_prompt and not any(m.get("role") == "system" for m in messages):
@@ -105,5 +135,45 @@ def reply_to_transcript(
     messages.append(build_user_message(transcript))
 
     if stream:
-        return stream_reply(processor, model, messages, max_new_tokens=max_new_tokens)
-    return generate_reply(processor, model, messages, max_new_tokens=max_new_tokens)
+        return stream_reply(processor, model, messages, max_new_tokens=max_new_tokens, tools=tools)
+    return generate_reply(
+        processor,
+        model,
+        messages,
+        max_new_tokens=max_new_tokens,
+        tools=tools,
+        skip_special_tokens=skip_special_tokens,
+    )
+
+
+def reply_from_history(
+    processor,
+    model,
+    history: list[Message],
+    *,
+    stream: bool = True,
+    max_new_tokens: int = 124,
+    system_prompt: str | None = SYSTEM_PROMPT,
+    tools: list | None = None,
+    skip_special_tokens: bool = True,
+) -> Iterator[str] | str:
+    """Generate from an already-assembled history (e.g. after a tool round-trip).
+
+    Unlike `reply_to_transcript`, this does not append a new user message — the
+    caller is responsible for the message list, including any assistant
+    `tool_calls` / `tool_responses` entries.
+    """
+    messages = list(history)
+    if system_prompt and not any(m.get("role") == "system" for m in messages):
+        messages.insert(0, build_system_message(system_prompt))
+
+    if stream:
+        return stream_reply(processor, model, messages, max_new_tokens=max_new_tokens, tools=tools)
+    return generate_reply(
+        processor,
+        model,
+        messages,
+        max_new_tokens=max_new_tokens,
+        tools=tools,
+        skip_special_tokens=skip_special_tokens,
+    )
