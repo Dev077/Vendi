@@ -22,6 +22,7 @@ export function useVoiceStream({
   silenceMs = 450,         // silence duration before ending utterance
   minUtteranceMs = 350,    // ignore blips shorter than this
   startHangoverMs = 80,    // require sustained voice this long before starting
+  onServerError = null,    // called with server-sent {type:"error"} payloads
 }) {
   const [connected, setConnected] = useState(false);
   const [listening, setListening] = useState(false);
@@ -74,9 +75,17 @@ export function useVoiceStream({
           try { msg = JSON.parse(ev.data); } catch { return; }
           if (msg.type === 'audio_start') playbackRef.current?.start(msg.sample_rate);
           else if (msg.type === 'audio_end') playbackRef.current?.flush();
+          else if (msg.type === 'error') {
+            console.error('[ws] server error:', msg);
+            onServerError?.(msg);
+          }
           else console.log('[ws]', msg);
         };
-        ws.onclose = () => setConnected(false);
+        ws.onerror = (ev) => console.error('[ws] error event:', ev);
+        ws.onclose = (ev) => {
+          console.log(`[ws] closed — code=${ev.code} reason=${ev.reason || '(empty)'} clean=${ev.wasClean}`);
+          setConnected(false);
+        };
 
         // 2. Open mic at 16kHz mono.
         const stream = await navigator.mediaDevices.getUserMedia({
