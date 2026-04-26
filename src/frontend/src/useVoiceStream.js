@@ -17,10 +17,11 @@ import { useEffect, useRef, useState } from 'react';
 export function useVoiceStream({
   enabled,
   wsUrl,
-  startThreshold = 0.02,   // RMS to begin an utterance
-  endThreshold = 0.012,    // RMS below this counts as silence
-  silenceMs = 800,         // silence duration before ending utterance
-  minUtteranceMs = 250,    // ignore blips shorter than this
+  startThreshold = 0.045,   // RMS to begin an utterance
+  endThreshold = 0.03,     // RMS below this counts as silence
+  silenceMs = 450,         // silence duration before ending utterance
+  minUtteranceMs = 350,    // ignore blips shorter than this
+  startHangoverMs = 80,    // require sustained voice this long before starting
 }) {
   const [connected, setConnected] = useState(false);
   const [listening, setListening] = useState(false);
@@ -37,6 +38,7 @@ export function useVoiceStream({
   const speakingRef = useRef(false);
   const utteranceStartRef = useRef(0);
   const lastVoiceRef = useRef(0);
+  const voiceOnsetRef = useRef(0);
 
   useEffect(() => {
     if (!enabled) return;
@@ -108,6 +110,9 @@ export function useVoiceStream({
           format: 'f32',
         }));
 
+        // Wake trigger — ask the server for an opening pitch immediately.
+        ws.send(JSON.stringify({ type: 'wake' }));
+
         await audioCtx.audioWorklet.addModule('/pcm-worklet.js');
         if (cancelled) {
           stream.getTracks().forEach((t) => t.stop());
@@ -137,15 +142,22 @@ export function useVoiceStream({
           if (!wsNow || wsNow.readyState !== WebSocket.OPEN) return;
 
           if (!speakingRef.current) {
-            // Not currently in an utterance — wait for voice onset.
+            // Not currently in an utterance — wait for sustained voice onset
+            // (avoid triggering on a single noisy chunk).
             if (rms >= startThreshold) {
-              speakingRef.current = true;
-              utteranceStartRef.current = now;
-              lastVoiceRef.current = now;
-              setSpeaking(true);
-              wsNow.send(JSON.stringify({ type: 'start' }));
-              // Send the chunk that triggered onset so we don't clip the first phoneme.
-              wsNow.send(buffer);
+              if (voiceOnsetRef.current === 0) {
+                voiceOnsetRef.current = now;
+              }
+              if (now - voiceOnsetRef.current >= startHangoverMs) {
+                speakingRef.current = true;
+                utteranceStartRef.current = voiceOnsetRef.current;
+                lastVoiceRef.current = now;
+                setSpeaking(true);
+                wsNow.send(JSON.stringify({ type: 'start' }));
+                wsNow.send(buffer);
+              }
+            } else {
+              voiceOnsetRef.current = 0;
             }
             return;
           }
@@ -159,6 +171,7 @@ export function useVoiceStream({
             // Silence long enough to end the utterance.
             const utteranceLen = now - utteranceStartRef.current;
             speakingRef.current = false;
+            voiceOnsetRef.current = 0;
             setSpeaking(false);
             if (utteranceLen >= minUtteranceMs) {
               wsNow.send(JSON.stringify({ type: 'end' }));
@@ -206,7 +219,7 @@ export function useVoiceStream({
       wsRef.current = null;
       playbackRef.current = null;
     };
-  }, [enabled, wsUrl, startThreshold, endThreshold, silenceMs, minUtteranceMs]);
+  }, [enabled, wsUrl, startThreshold, endThreshold, silenceMs, minUtteranceMs, startHangoverMs]);
 
   return { connected, listening, speaking };
 }

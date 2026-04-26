@@ -149,6 +149,47 @@ def _speak(ws, tts, text: str) -> None:
     ws.send(json.dumps({"type": "audio_end"}))
 
 
+# Internal stage-direction sent to the LLM on wake. Not shown to the user;
+# the LLM treats it as instructions for its opening line.
+_WAKE_CUE = (
+    "(STAGE DIRECTION: A customer has just walked up to the vending machine. "
+    "They have not spoken yet. Deliver a short, punchy opening pitch to grab "
+    "their attention and lure them in — like a hot-dog vendor at a baseball "
+    "game. One max. Stay in character as Vendi.)"
+)
+
+
+def _handle_wake(ws, history: list) -> None:
+    import json
+    comps = _get_voice_components()
+    processor = comps["processor"]
+    model = comps["model"]
+    tts = comps["tts"]
+
+    reply_chunks: list[str] = []
+    sentence_buf = ""
+    for chunk in reply_to_transcript(processor, model, _WAKE_CUE, history=history, stream=True):
+        reply_chunks.append(chunk)
+        ws.send(json.dumps({"type": "token", "text": chunk}))
+        sentence_buf += chunk
+        while True:
+            m = _SENTENCE_END.search(sentence_buf)
+            if not m:
+                break
+            sentence, sentence_buf = sentence_buf[: m.end()], sentence_buf[m.end():]
+            _speak(ws, tts, sentence)
+
+    if sentence_buf.strip():
+        _speak(ws, tts, sentence_buf)
+
+    history.append({"role": "user", "content": [{"type": "text", "text": _WAKE_CUE}]})
+    history.append({"role": "assistant", "content": [{"type": "text", "text": "".join(reply_chunks)}]})
+    ws.send(json.dumps({"type": "done"}))
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def _handle_utterance(ws, pcm_buffer: bytearray, history: list, discard: bool) -> None:
     import json
     if discard or not pcm_buffer:
@@ -262,6 +303,14 @@ def audio_socket(ws):
                     print(f"[voice] error: {e}")
                     ws.send(json.dumps({"type": "error", "message": str(e)}))
                 pcm_buffer = bytearray()
+
+            elif ctrl_type == "wake":
+                print("[ws] wake — generating opening pitch")
+                try:
+                    _handle_wake(ws, history)
+                except Exception as e:
+                    print(f"[voice] wake error: {e}")
+                    ws.send(json.dumps({"type": "error", "message": str(e)}))
 
             elif ctrl_type == "ping":
                 ws.send(json.dumps({"type": "pong"}))
