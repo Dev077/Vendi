@@ -19,6 +19,7 @@ dependencies = [
     "pillow>=12.2.0",
     "torchvision>=0.26.0",
     "accelerate>=1.13.0",
+    "pyserial>=3.5",
 ]
 
 [build-system]
