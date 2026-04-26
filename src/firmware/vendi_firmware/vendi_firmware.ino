@@ -14,7 +14,11 @@ void loop() {
   if (Serial.available() > 0) {
     // Read the incoming float
     float degrees = Serial.parseFloat();
-    
+
+    Serial.print("Moving ");
+    Serial.print(degrees);
+    Serial.println(" degrees.");
+
     // Logic to ignore trailing zeros or empty enters
     if (degrees != 0) {
       // Calculate steps
@@ -23,8 +27,6 @@ void loop() {
       myStepper.step(stepsToMove);
     }
 
-    Serial.print("Moving ");
-    Serial.print(degrees);
-    Serial.println(" degrees.");
+    Serial.println("Done.");
   }
 }
