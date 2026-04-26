@@ -1,5 +1,7 @@
 import os
 import re
+import json
+import traceback
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -88,29 +90,52 @@ def process_frame():
     # 4. Logic Gate: Check threshold and cooldown
     if motion_score > 10000:
         current_time = time.time()
-        
+
         if (current_time - last_api_call_time) > COOLDOWN_SECONDS:
             print("Motion detected! Calling Vision API...")
             last_api_call_time = current_time
-            
+
             # Encode frame to JPEG bytes for Google Vision
-            success, encoded_image = cv2.imencode('.jpg', frame)
+            _, encoded_image = cv2.imencode('.jpg', frame)
             content = encoded_image.tobytes()
             vision_image = vision.Image(content=content)
-            
-            # Call Google Cloud Vision API
+
+            # Call Google Cloud Vision API — try object localization first,
+            # then fall back to face detection (close-up webcam framing
+            # often returns "Face" / "Head" rather than "Person").
             response = client.object_localization(image=vision_image)
             objects = response.localized_object_annotations
-            
-            # Check for humans
+
+            # Anything in this set counts as "a human is here".
+            HUMAN_LABELS = {"person", "face", "head", "human", "man", "woman", "boy", "girl"}
+
+            detected = [(obj.name, round(obj.score * 100, 1)) for obj in objects]
+            print(f"[vision] objects: {detected}")
+            result["objects"] = detected
+
             for obj in objects:
-                if obj.name.lower() == 'person':
+                if obj.name.lower() in HUMAN_LABELS and obj.score >= 0.5:
                     result["human_detected"] = True
                     result["confidence"] = round(obj.score * 100, 1)
+                    result["matched"] = obj.name
                     break
-            
+
+            # Fallback: explicit face detection if no human-ish object found.
+            if not result["human_detected"]:
+                face_resp = client.face_detection(image=vision_image)
+                faces = face_resp.face_annotations
+                print(f"[vision] faces: {len(faces)}")
+                if faces:
+                    result["human_detected"] = True
+                    result["confidence"] = round(faces[0].detection_confidence * 100, 1)
+                    result["matched"] = "Face (face_detection)"
+
             result["api_called"] = True
-            result["message"] = "API called: Human found!" if result["human_detected"] else "API called: False alarm."
+            result["message"] = (
+                f"API called: Human found ({result.get('matched')})!"
+                if result["human_detected"]
+                else "API called: False alarm."
+            )
         else:
             result["message"] = "Motion detected, but API is on cooldown."
     else:
@@ -141,7 +166,6 @@ def _speak(ws, tts, text: str) -> None:
     text = text.strip()
     if not text:
         return
-    import json
     ws.send(json.dumps({"type": "audio_start", "sample_rate": tts.sample_rate}))
     for pcm in tts.synthesize_stream(text):
         if pcm:
@@ -160,7 +184,6 @@ _WAKE_CUE = (
 
 
 def _handle_wake(ws, history: list) -> None:
-    import json
     comps = _get_voice_components()
     processor = comps["processor"]
     model = comps["model"]
@@ -191,7 +214,6 @@ def _handle_wake(ws, history: list) -> None:
 
 
 def _handle_utterance(ws, pcm_buffer: bytearray, history: list, discard: bool) -> None:
-    import json
     if discard or not pcm_buffer:
         return
 
@@ -235,39 +257,44 @@ def _handle_utterance(ws, pcm_buffer: bytearray, history: list, discard: bool) -
         torch.cuda.empty_cache()
 
 
+def _safe_send(ws, payload) -> bool:
+    """Send and return False if the socket is already closed instead of raising."""
+    try:
+        ws.send(payload)
+        return True
+    except Exception as e:
+        print(f"[ws] send failed (peer likely gone): {type(e).__name__}: {e}")
+        return False
+
+
 @sock.route('/ws/audio')
 def audio_socket(ws):
-    import json
-
     print("[ws] client connected")
     pcm_buffer = bytearray()
     sample_rate = 16000  # default; client should override via meta
     in_utterance = False
     utterance_start = 0.0
     history: list = []
+    exit_reason = "client closed (None frame)"
 
     try:
         while True:
             # receive() returns str for text frames, bytes for binary frames.
             msg = ws.receive()
             if msg is None:
-                # client closed
                 break
 
             if isinstance(msg, (bytes, bytearray)):
                 # Binary frame — raw PCM samples for the current utterance.
                 if in_utterance:
                     pcm_buffer.extend(msg)
-                else:
-                    # ignore stray audio outside an utterance window
-                    pass
                 continue
 
             # Text frame — control message.
             try:
                 ctrl = json.loads(msg)
             except json.JSONDecodeError:
-                ws.send(json.dumps({"type": "error", "message": "invalid JSON control frame"}))
+                _safe_send(ws, json.dumps({"type": "error", "message": "invalid JSON control frame"}))
                 continue
 
             ctrl_type = ctrl.get("type")
@@ -275,18 +302,18 @@ def audio_socket(ws):
             if ctrl_type == "meta":
                 sample_rate = int(ctrl.get("sampleRate", sample_rate))
                 print(f"[ws] meta: sampleRate={sample_rate} channels={ctrl.get('channels')} format={ctrl.get('format')}")
-                ws.send(json.dumps({"type": "meta_ack", "sampleRate": sample_rate}))
+                _safe_send(ws, json.dumps({"type": "meta_ack", "sampleRate": sample_rate}))
 
             elif ctrl_type == "start":
                 pcm_buffer = bytearray()
                 in_utterance = True
                 utterance_start = time.time()
                 print("[ws] utterance start")
-                ws.send(json.dumps({"type": "start_ack"}))
+                _safe_send(ws, json.dumps({"type": "start_ack"}))
 
             elif ctrl_type == "end":
                 if not in_utterance:
-                    ws.send(json.dumps({"type": "error", "message": "end without start"}))
+                    _safe_send(ws, json.dumps({"type": "error", "message": "end without start"}))
                     continue
                 in_utterance = False
                 duration = time.time() - utterance_start
@@ -300,8 +327,9 @@ def audio_socket(ws):
                 try:
                     _handle_utterance(ws, pcm_buffer, history, discard)
                 except Exception as e:
-                    print(f"[voice] error: {e}")
-                    ws.send(json.dumps({"type": "error", "message": str(e)}))
+                    print(f"[voice] utterance error: {type(e).__name__}: {e}")
+                    traceback.print_exc()
+                    _safe_send(ws, json.dumps({"type": "error", "stage": "utterance", "message": f"{type(e).__name__}: {e}"}))
                 pcm_buffer = bytearray()
 
             elif ctrl_type == "wake":
@@ -309,19 +337,21 @@ def audio_socket(ws):
                 try:
                     _handle_wake(ws, history)
                 except Exception as e:
-                    print(f"[voice] wake error: {e}")
-                    ws.send(json.dumps({"type": "error", "message": str(e)}))
+                    print(f"[voice] wake error: {type(e).__name__}: {e}")
+                    traceback.print_exc()
+                    _safe_send(ws, json.dumps({"type": "error", "stage": "wake", "message": f"{type(e).__name__}: {e}"}))
 
             elif ctrl_type == "ping":
-                ws.send(json.dumps({"type": "pong"}))
+                _safe_send(ws, json.dumps({"type": "pong"}))
 
             else:
-                ws.send(json.dumps({"type": "error", "message": f"unknown control type: {ctrl_type}"}))
+                _safe_send(ws, json.dumps({"type": "error", "message": f"unknown control type: {ctrl_type}"}))
 
     except Exception as e:
-        print(f"[ws] error: {e}")
+        exit_reason = f"loop exception: {type(e).__name__}: {e}"
+        traceback.print_exc()
     finally:
-        print("[ws] client disconnected")
+        print(f"[ws] client disconnected — {exit_reason}")
 
 
 if __name__ == '__main__':
