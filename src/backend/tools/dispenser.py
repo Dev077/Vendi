@@ -9,6 +9,7 @@ overlapping calls queue cleanly instead of racing on the serial port.
 from __future__ import annotations
 
 import threading
+import time
 
 from backend.vendi_com import VendiCom
 
@@ -16,6 +17,8 @@ from backend.vendi_com import VendiCom
 # Hardware-calibrated angles for one full dispense cycle.
 DISPENSE_ANGLE = 250.0
 RETURN_ANGLE = -250.0
+# Pause at the open position so the can has time to drop before we rotate back.
+DROP_DELAY_SECONDS = 2.0
 
 
 class Dispenser:
@@ -28,6 +31,7 @@ class Dispenser:
         with self._lock:
             self._com.set(DISPENSE_ANGLE)
             self._com.wait_done()
+            time.sleep(DROP_DELAY_SECONDS)
             self._com.set(RETURN_ANGLE)
             self._com.wait_done()
 

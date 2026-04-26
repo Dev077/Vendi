@@ -14,7 +14,10 @@ class VendiCom:
             self.ser = serial.Serial(port, baud_rate, timeout=1)
 
     def set(self, angle):
-        self.ser.write(f"{angle}".encode())
+        # Trailing \n terminates Serial.parseFloat() on the firmware immediately
+        # instead of making it wait for its 1s stream timeout.
+        self.ser.write(f"{angle}\n".encode())
+        self.ser.flush()
 
     def wait_done(self, timeout=10.0):
         """Block until the firmware prints 'Done.', or `timeout` seconds elapse.
