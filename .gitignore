@@ -2,3 +2,4 @@
 /backend/.env
 .env
 src/backend/aise3010-492923-01669646b860.json
+**/__pycache__/
