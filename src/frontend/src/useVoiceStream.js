@@ -23,6 +23,7 @@ export function useVoiceStream({
   minUtteranceMs = 350,    // ignore blips shorter than this
   startHangoverMs = 80,    // require sustained voice this long before starting
   onServerError = null,    // called with server-sent {type:"error"} payloads
+  onExpression = null,     // called with the name from {type:"expression", name}
 }) {
   const [connected, setConnected] = useState(false);
   const [listening, setListening] = useState(false);
@@ -75,6 +76,10 @@ export function useVoiceStream({
           try { msg = JSON.parse(ev.data); } catch { return; }
           if (msg.type === 'audio_start') playbackRef.current?.start(msg.sample_rate);
           else if (msg.type === 'audio_end') playbackRef.current?.flush();
+          else if (msg.type === 'expression') {
+            console.log(`[ws] expression received: ${msg.name}`);
+            onExpression?.(msg.name);
+          }
           else if (msg.type === 'error') {
             console.error('[ws] server error:', msg);
             onServerError?.(msg);

@@ -37,15 +37,25 @@ class ErrorBoundary extends Component {
 function App() {
   const webcamRef = useRef(null);
   const intervalRef = useRef(null);
+  const live2dRef = useRef(null);
   const [isAwake, setIsAwake] = useState(false);
   const [debug, setDebug] = useState({ status: 'starting…', motionScore: 0, objects: [] });
   const [serverError, setServerError] = useState(null);
+
+  const handleExpression = useCallback((name) => {
+    if (!live2dRef.current) {
+      console.warn(`[App] expression "${name}" arrived before Live2D ref was attached — dropping`);
+      return;
+    }
+    live2dRef.current.setExpression(name);
+  }, []);
 
   // Voice streaming activates only after wake.
   const { connected, listening, speaking } = useVoiceStream({
     enabled: isAwake,
     wsUrl: WS_URL,
     onServerError: setServerError,
+    onExpression: handleExpression,
   });
 
   // Function to capture the current frame and send it to Flask
@@ -161,7 +171,7 @@ function App() {
 
       {isAwake && (
         <ErrorBoundary onReset={() => { setIsAwake(false); setServerError(null); }}>
-          <Live2DCharacter modelUrl={MODEL_URL} />
+          <Live2DCharacter ref={live2dRef} modelUrl={MODEL_URL} />
           <div
             style={{
               position: 'absolute',

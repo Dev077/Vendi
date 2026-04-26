@@ -13,14 +13,38 @@ import numpy as np
 from faster_whisper import WhisperModel
 
 
+# distil-large-v3 hallucinates these on near-silence. Compared lowercase,
+# stripped of punctuation/whitespace.
+_HALLUCINATIONS = frozenset({
+    "thank you", "thanks for watching", "thanks", "you", "bye", "okay", "ok",
+    "uh", "um", "hmm", "mm", "mhm", "yeah", "the", "a", "i", ".",
+})
+
+
+def _normalize(text: str) -> str:
+    return "".join(c for c in text.lower() if c.isalnum() or c == " ").strip()
+
+
 @dataclass
 class Transcript:
     text: str
     avg_logprob: float
     no_speech_prob: float
 
-    def is_confident(self, min_logprob: float = -1.0, max_no_speech: float = 0.6) -> bool:
-        return self.avg_logprob >= min_logprob and self.no_speech_prob <= max_no_speech
+    def is_confident(
+        self,
+        min_logprob: float = -0.7,
+        max_no_speech: float = 0.35,
+        min_chars: int = 3,
+    ) -> bool:
+        if self.avg_logprob < min_logprob or self.no_speech_prob > max_no_speech:
+            return False
+        norm = _normalize(self.text)
+        if len(norm) < min_chars:
+            return False
+        if norm in _HALLUCINATIONS:
+            return False
+        return True
 
 
 class ASR:

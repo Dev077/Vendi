@@ -50,6 +50,11 @@ _TOOL_CALL_RE = re.compile(
     re.DOTALL,
 )
 
+# Inline emotion tag from the system prompt: [[emo:NAME]]. Stripped from the
+# spoken text and dispatched to the client as an `expression` event so the
+# Live2D model's face matches the line being delivered.
+_EMO_RE = re.compile(r"\[\[emo:(\w+)\]\]", re.IGNORECASE)
+
 # Heavy components — loaded lazily on first WS connection so the vision
 # endpoint stays usable without GPU/model deps.
 _voice_components: dict | None = None
@@ -197,6 +202,16 @@ def _speak(ws, tts, text: str) -> None:
     text = text.strip()
     if not text:
         return
+    # Pull out any [[emo:NAME]] tags and dispatch them as expression events
+    # *before* speaking, so the face changes as (or just before) the audio
+    # starts. The TTS never sees the tags.
+    for m in _EMO_RE.finditer(text):
+        name = m.group(1).lower()
+        print(f"[expression] dispatch: {name}")
+        ws.send(json.dumps({"type": "expression", "name": name}))
+    text = _EMO_RE.sub("", text).strip()
+    if not text:
+        return
     ws.send(json.dumps({"type": "audio_start", "sample_rate": tts.sample_rate}))
     for pcm in tts.synthesize_stream(text):
         if pcm:
@@ -208,7 +223,7 @@ def _speak(ws, tts, text: str) -> None:
 # the LLM treats it as instructions for its opening line.
 _WAKE_CUE = (
     "(STAGE DIRECTION: A customer has just walked up to the vending machine. "
-    "They have not spoken yet. Deliver a short, punchy opening pitch to grab "
+    "They have not spoken yet. Introduce yourself as Vendi, then deliver a short, punchy opening pitch to grab "
     "their attention and lure them in — like a hot-dog vendor at a baseball "
     "game. One max. Stay in character as Vendi.)"
 )
@@ -353,6 +368,15 @@ def _handle_utterance(ws, pcm_buffer: bytearray, history: list, discard: bool) -
     asr = comps["asr"]
 
     audio = np.frombuffer(bytes(pcm_buffer), dtype=np.float32)
+
+    # Drop clips that are too short OR too quiet to plausibly contain speech —
+    # cheaper than running ASR and avoids feeding it room tone.
+    duration_s = len(audio) / 16000.0
+    rms = float(np.sqrt(np.mean(audio.astype(np.float32) ** 2))) if len(audio) else 0.0
+    if duration_s < 0.5 or rms < 0.015:
+        print(f"[voice] dropped short/quiet utterance: {duration_s:.2f}s rms={rms:.4f}")
+        return
+
     transcript = asr.transcribe_pcm(audio)
 
     if not transcript.text or not transcript.is_confident():
