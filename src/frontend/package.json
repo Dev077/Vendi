@@ -10,6 +10,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "pixi-live2d-display": "^0.4.0",
+    "pixi.js": "6.5.10",
     "react": "^19.2.5",
     "react-dom": "^19.2.5",
     "react-webcam": "^7.2.0"
